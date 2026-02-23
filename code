@@ -1,0 +1,1028 @@
+"""
+ECG Heartbeat Classification System - Version Professionnelle
+Analyse et classification des battements cardiaques MIT-BIH
+"""
+
+import os
+import sys
+import json
+import logging
+import warnings
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional, Union, Any
+from pathlib import Path
+from datetime import datetime
+import hashlib
+import pickle
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import stats, signal as sp_signal
+from sklearn.preprocessing import LabelEncoder, StandardScaler, label_binarize
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import (classification_report, confusion_matrix, f1_score,
+                             roc_curve, auc, precision_recall_curve)
+from sklearn.utils.class_weight import compute_class_weight
+
+# Configuration du logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('ecg_analysis.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Suppression des warnings non critiques
+warnings.filterwarnings('ignore', category=UserWarning)
+warnings.filterwarnings('ignore', category=FutureWarning)
+
+# Configuration des seeds pour reproductibilité
+RANDOM_SEED = 42
+np.random.seed(RANDOM_SEED)
+
+# Imports conditionnels pour les librairies lourdes
+try:
+    import tensorflow as tf
+
+    tf.random.set_seed(RANDOM_SEED)
+    from tensorflow.keras import layers, models, callbacks, optimizers, regularizers
+    from tensorflow.keras.utils import Sequence, to_categorical
+
+    TF_AVAILABLE = True
+except ImportError:
+    logger.warning("TensorFlow non disponible - Les modèles DL seront désactivés")
+    TF_AVAILABLE = False
+
+try:
+    import wfdb
+    import wfdb.processing
+
+    WFDB_AVAILABLE = True
+except ImportError:
+    logger.warning("WFDB non disponible")
+    WFDB_AVAILABLE = False
+
+try:
+    import neurokit2 as nk
+
+    NK_AVAILABLE = True
+except ImportError:
+    logger.warning("NeuroKit2 non disponible")
+    NK_AVAILABLE = False
+
+try:
+    import xgboost as xgb
+
+    XGB_AVAILABLE = True
+except ImportError:
+    logger.warning("XGBoost non disponible")
+    XGB_AVAILABLE = False
+
+try:
+    import librosa
+
+    LIBROSA_AVAILABLE = True
+except ImportError:
+    logger.warning("Librosa non disponible")
+    LIBROSA_AVAILABLE = False
+
+
+# ============================================================
+# CONFIGURATION CENTRALISÉE
+# ============================================================
+@dataclass
+class ECGConfig:
+    """Configuration centralisée et validée"""
+    # Paramètres du signal
+    fs: int = 360
+    window_before_ms: float = 200.0
+    window_after_ms: float = 400.0
+    desired_length: int = 300
+
+    # Labels valides selon la nomenclature MIT-BIH
+    valid_labels: List[str] = field(default_factory=lambda: ["N", "V", "A", "L", "R"])
+    label_names: Dict[str, str] = field(default_factory=lambda: {
+        "N": "Normal",
+        "V": "Ventricular Ectopic",
+        "A": "Atrial Ectopic",
+        "L": "Left Bundle Branch Block",
+        "R": "Right Bundle Branch Block"
+    })
+
+    # Paramètres de traitement
+    n_workers: int = 4
+    batch_size: int = 32
+    cache_enabled: bool = True
+
+    # Paramètres de split
+    test_size: float = 0.2
+    val_size: float = 0.2
+    random_state: int = 42
+
+    # Paramètres DL
+    max_epochs: int = 100
+    early_stopping_patience: int = 15
+    reduce_lr_patience: int = 5
+    min_lr: float = 1e-7
+
+    # Chemins
+    records_dir: str = "mitdb"
+    plots_dir: str = "plots"
+    cache_dir: str = "cache"
+    models_dir: str = "models"
+
+    def __post_init__(self):
+        """Calculs dérivés et validation"""
+        self.window_before_samples = int(self.window_before_ms * self.fs / 1000)
+        self.window_after_samples = int(self.window_after_ms * self.fs / 1000)
+
+        # Création des répertoires
+        for dir_path in [self.records_dir, self.plots_dir, self.cache_dir, self.models_dir]:
+            Path(dir_path).mkdir(parents=True, exist_ok=True)
+
+        # Validation
+        assert self.test_size + self.val_size < 1.0, "La somme des splits doit être < 1"
+        assert self.fs > 0, "La fréquence d'échantillonnage doit être positive"
+
+
+# ============================================================
+# GESTION DU CACHE
+# ============================================================
+class CacheManager:
+    """Gestionnaire de cache intelligent avec hash"""
+
+    def __init__(self, cache_dir: str):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self._memory_cache: Dict[str, Any] = {}
+
+    def _generate_key(self, *args, **kwargs) -> str:
+        """Génère une clé unique basée sur les arguments"""
+        key_data = json.dumps({
+            'args': args,
+            'kwargs': kwargs,
+            'version': '1.0'  # Version du cache pour invalidation
+        }, sort_keys=True, default=str)
+        return hashlib.md5(key_data.encode()).hexdigest()
+
+    def get(self, key: str) -> Optional[Any]:
+        """Récupère du cache mémoire ou disque"""
+        if key in self._memory_cache:
+            logger.debug(f"Cache hit (memory): {key[:8]}...")
+            return self._memory_cache[key]
+
+        cache_file = self.cache_dir / f"{key}.pkl"
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'rb') as f:
+                    data = pickle.load(f)
+                    self._memory_cache[key] = data
+                    logger.debug(f"Cache hit (disk): {key[:8]}...")
+                    return data
+            except Exception as e:
+                logger.warning(f"Erreur lecture cache: {e}")
+                return None
+        return None
+
+    def set(self, key: str, value: Any) -> None:
+        """Stocke dans le cache mémoire et disque"""
+        self._memory_cache[key] = value
+        cache_file = self.cache_dir / f"{key}.pkl"
+        try:
+            with open(cache_file, 'wb') as f:
+                pickle.dump(value, f)
+        except Exception as e:
+            logger.error(f"Erreur écriture cache: {e}")
+
+    def clear(self) -> None:
+        """Vide tout le cache"""
+        self._memory_cache.clear()
+        for f in self.cache_dir.glob("*.pkl"):
+            f.unlink()
+        logger.info("Cache vidé")
+
+
+# ============================================================
+# CHARGEMENT DES DONNÉES
+# ============================================================
+class ECGDataLoader:
+    """Chargeur robuste de données MIT-BIH avec retry"""
+
+    def __init__(self, config: ECGConfig, cache: Optional[CacheManager] = None):
+        self.config = config
+        self.cache = cache
+        self.downloaded_records: set = set()
+
+    def download_records(self, records: List[str], max_retries: int = 3) -> List[str]:
+        """Télécharge les enregistrements avec retry"""
+        if not WFDB_AVAILABLE:
+            raise RuntimeError("WFDB non disponible")
+
+        successful = []
+
+        for record in records:
+            if record in self.downloaded_records:
+                continue
+
+            for attempt in range(max_retries):
+                try:
+                    wfdb.dl_database('mitdb', dl_dir=self.config.records_dir, records=[record])
+                    self.downloaded_records.add(record)
+                    successful.append(record)
+                    logger.info(f"✓ Enregistrement {record} téléchargé")
+                    break
+                except Exception as e:
+                    logger.warning(f"Tentative {attempt + 1}/{max_retries} échouée pour {record}: {e}")
+                    if attempt == max_retries - 1:
+                        logger.error(f"✗ Échec téléchargement {record}")
+
+        return successful
+
+    def load_record(self, record_name: str) -> Optional[Dict]:
+        """Charge un enregistrement avec cache"""
+        cache_key = f"record_{record_name}"
+        if self.cache:
+            cached = self.cache.get(cache_key)
+            if cached is not None:
+                return cached
+
+        try:
+            record_path = Path(self.config.records_dir) / record_name
+
+            if not (record_path.with_suffix('.dat')).exists():
+                logger.error(f"Fichier .dat manquant pour {record_name}")
+                return None
+
+            # Chargement du signal
+            record = wfdb.rdrecord(str(record_path))
+            ecg_signal = record.p_signal[:, 0]
+            fs = record.fs
+
+            # Détection des R-peaks avec fallback
+            r_peaks = self._detect_r_peaks(ecg_signal, fs)
+
+            # Annotations
+            ann_pos, ann_sym = self._load_annotations(record_path)
+
+            # Nettoyage du signal
+            ecg_clean = self._clean_signal(ecg_signal, fs)
+
+            result = {
+                'name': record_name,
+                'signal': ecg_clean,
+                'r_peaks': r_peaks,
+                'ann_pos': ann_pos,
+                'ann_sym': ann_sym,
+                'fs': fs
+            }
+
+            if self.cache:
+                self.cache.set(cache_key, result)
+
+            return result
+
+        except Exception as e:
+            logger.error(f"Erreur chargement {record_name}: {e}")
+            return None
+
+    def _detect_r_peaks(self, signal: np.ndarray, fs: int) -> np.ndarray:
+        """Détection robuste des R-peaks avec fallback"""
+        methods = [
+            lambda: wfdb.processing.XQRS(sig=signal, fs=fs).detect() or wfdb.processing.xqrs_peaks,
+            lambda: wfdb.processing.gqrs_detect(signal, fs=fs),
+            lambda: wfdb.processing.find_peaks(signal, height=np.std(signal))[0]
+        ]
+
+        for i, method in enumerate(methods):
+            try:
+                peaks = method()
+                if len(peaks) > 0:
+                    logger.debug(f"Détection R-peaks méthode {i + 1}: {len(peaks)} pics trouvés")
+                    return np.array(peaks)
+            except Exception as e:
+                logger.debug(f"Méthode {i + 1} échouée: {e}")
+                continue
+
+        logger.warning("Aucune méthode de détection R-peaks n'a fonctionné")
+        return np.array([])
+
+    def _load_annotations(self, record_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+        """Charge les annotations si disponibles"""
+        try:
+            annotation = wfdb.rdann(str(record_path), "atr")
+            return np.array(annotation.sample), np.array(annotation.symbol)
+        except Exception:
+            return np.array([]), np.array([])
+
+    def _clean_signal(self, signal: np.ndarray, fs: int) -> np.ndarray:
+        """Nettoyage du signal avec fallback"""
+        if NK_AVAILABLE:
+            try:
+                return nk.ecg_clean(signal, sampling_rate=fs)
+            except Exception as e:
+                logger.debug(f"NeuroKit2 a échoué: {e}")
+        return signal  # Fallback: signal brut
+
+
+# ============================================================
+# EXTRACTION DE SEGMENTS ET FEATURES
+# ============================================================
+class FeatureExtractor:
+    """Extracteur de caractéristiques ECG complet"""
+
+    def __init__(self, config: ECGConfig):
+        self.config = config
+
+    def extract_segments(self, record: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Extrait les segments autour des R-peaks"""
+        signal = record['signal']
+        r_peaks = record['r_peaks']
+        ann_pos = record['ann_pos']
+        ann_sym = record['ann_sym']
+        fs = record['fs']
+
+        if len(r_peaks) == 0:
+            return np.array([]), np.array([]), np.array([])
+
+        # Association R-peaks -> labels
+        labels = self._match_labels(r_peaks, ann_pos, ann_sym, fs)
+
+        segments = []
+        seg_labels = []
+        indices = []
+
+        for i, (r, label) in enumerate(zip(r_peaks, labels)):
+            start = r - self.config.window_before_samples
+            end = r + self.config.window_after_samples
+
+            if start < 0 or end >= len(signal):
+                continue
+
+            seg = signal[start:end]
+
+            # Rééchantillonnage
+            try:
+                seg_resampled = sp_signal.resample(seg, self.config.desired_length)
+                segments.append(seg_resampled)
+                seg_labels.append(label)
+                indices.append(i)
+            except Exception as e:
+                logger.debug(f"Erreur rééchantillonnage segment {i}: {e}")
+
+        return (np.array(segments),
+                np.array(seg_labels),
+                np.array(indices))
+
+    def _match_labels(self, r_peaks: np.ndarray, ann_pos: np.ndarray,
+                      ann_sym: np.ndarray, fs: int) -> List[str]:
+        """Apparie les R-peaks avec les annotations"""
+        if len(ann_pos) == 0:
+            return ["UNKNOWN"] * len(r_peaks)
+
+        tolerance = int(fs * 0.1)  # 100ms
+        labels = []
+
+        for r in r_peaks:
+            diffs = np.abs(ann_pos - r)
+            idx = np.argmin(diffs)
+            if diffs[idx] <= tolerance:
+                labels.append(ann_sym[idx])
+            else:
+                labels.append("UNKNOWN")
+
+        return labels
+
+    def extract_temporal_features(self, r_peaks: np.ndarray, signal: np.ndarray,
+                                  labels: np.ndarray, fs: int) -> pd.DataFrame:
+        """Extrait les caractéristiques temporelles"""
+        if len(r_peaks) < 2:
+            return pd.DataFrame()
+
+        # Intervalles RR en ms
+        rr_intervals = np.diff(r_peaks) / fs * 1000
+
+        # Padding pour avoir la même longueur que r_peaks
+        rr_padded = np.zeros(len(r_peaks))
+        rr_padded[:-1] = rr_intervals
+
+        # Features
+        df = pd.DataFrame({
+            'RR_interval': rr_padded,
+            'Amplitude_R': signal[r_peaks],
+            'Label': labels
+        })
+
+        # Features dérivées si assez de données
+        if len(rr_intervals) > 0:
+            df['Next_RR'] = np.concatenate([[np.nan], rr_intervals])
+            df['RR_ratio'] = np.concatenate([[np.nan],
+                                             np.divide(rr_intervals[1:], rr_intervals[:-1],
+                                                       out=np.zeros_like(rr_intervals[1:]),
+                                                       where=rr_intervals[:-1] != 0), [np.nan]])
+            df['Heart_rate'] = 60000 / (rr_padded + 1e-10)
+
+            # Rolling stats
+            rr_series = pd.Series(rr_padded)
+            df['RR_mean_5'] = rr_series.rolling(5, min_periods=1).mean()
+            df['RR_std_5'] = rr_series.rolling(5, min_periods=1).std().fillna(0)
+
+        return df
+
+    def extract_morphological_features(self, segments: np.ndarray) -> pd.DataFrame:
+        """Extrait les caractéristiques morphologiques"""
+        features = []
+
+        for seg in segments:
+            feat = {
+                'mean': np.mean(seg),
+                'std': np.std(seg),
+                'min': np.min(seg),
+                'max': np.max(seg),
+                'range': np.max(seg) - np.min(seg),
+                'median': np.median(seg),
+                'skewness': stats.skew(seg),
+                'kurtosis': stats.kurtosis(seg),
+                'zero_crossings': np.sum(np.diff(np.sign(seg)) != 0),
+                'rms': np.sqrt(np.mean(seg ** 2))
+            }
+
+            # Features fréquentielles
+            fft_vals = np.abs(np.fft.rfft(seg))
+            feat['dominant_freq'] = np.argmax(fft_vals)
+            feat['spectral_energy'] = np.sum(fft_vals ** 2)
+
+            features.append(feat)
+
+        return pd.DataFrame(features)
+
+
+# ============================================================
+# MODÈLES DE MACHINE LEARNING
+# ============================================================
+class BaseModel:
+    """Classe de base pour tous les modèles"""
+
+    def __init__(self, name: str, config: ECGConfig):
+        self.name = name
+        self.config = config
+        self.model = None
+        self.is_trained = False
+        self.training_history = {}
+
+    def train(self, X_train: np.ndarray, y_train: np.ndarray,
+              class_weights: Optional[Dict] = None) -> 'BaseModel':
+        raise NotImplementedError
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        raise NotImplementedError
+
+    def evaluate(self, X_test: np.ndarray, y_test: np.ndarray,
+                 label_encoder: LabelEncoder) -> Dict:
+        """Évaluation complète"""
+        if not self.is_trained:
+            raise RuntimeError("Modèle non entraîné")
+
+        y_pred = self.predict(X_test)
+        y_proba = self.predict_proba(X_test)
+
+        # Métriques
+        report = classification_report(
+            y_test, y_pred,
+            target_names=label_encoder.classes_,
+            output_dict=True,
+            zero_division=0
+        )
+
+        f1 = f1_score(y_test, y_pred, average='weighted', zero_division=0)
+
+        # Matrice de confusion
+        cm = confusion_matrix(y_test, y_pred)
+
+        return {
+            'f1_score': f1,
+            'accuracy': report['accuracy'],
+            'classification_report': report,
+            'confusion_matrix': cm,
+            'predictions': y_pred,
+            'probabilities': y_proba
+        }
+
+    def save(self, path: str) -> None:
+        """Sauvegarde le modèle"""
+        raise NotImplementedError
+
+    def load(self, path: str) -> 'BaseModel':
+        """Charge le modèle"""
+        raise NotImplementedError
+
+
+class SklearnModel(BaseModel):
+    """Wrapper pour les modèles scikit-learn"""
+
+    SUPPORTED_MODELS = ['rf', 'xgboost', 'logistic', 'svm']
+
+    def __init__(self, model_type: str, config: ECGConfig):
+        super().__init__(model_type, config)
+        self.model_type = model_type
+        self._build_model()
+
+    def _build_model(self):
+        """Construction du modèle"""
+        if self.model_type == 'rf':
+            from sklearn.ensemble import RandomForestClassifier
+            self.model = RandomForestClassifier(
+                n_estimators=200,
+                max_depth=15,
+                min_samples_split=5,
+                class_weight='balanced',
+                random_state=self.config.random_state,
+                n_jobs=-1
+            )
+        elif self.model_type == 'xgboost':
+            if not XGB_AVAILABLE:
+                raise RuntimeError("XGBoost non disponible")
+            self.model = xgb.XGBClassifier(
+                objective='multi:softprob',
+                n_estimators=300,
+                max_depth=6,
+                learning_rate=0.05,
+                subsample=0.9,
+                colsample_bytree=0.9,
+                random_state=self.config.random_state,
+                n_jobs=-1
+            )
+        elif self.model_type == 'logistic':
+            from sklearn.linear_model import LogisticRegression
+            self.model = LogisticRegression(
+                max_iter=1000,
+                class_weight='balanced',
+                random_state=self.config.random_state,
+                multi_class='multinomial'
+            )
+        elif self.model_type == 'svm':
+            from sklearn.svm import SVC
+            self.model = SVC(
+                probability=True,
+                class_weight='balanced',
+                random_state=self.config.random_state
+            )
+        else:
+            raise ValueError(f"Modèle non supporté: {self.model_type}")
+
+    def train(self, X_train, y_train, class_weights=None):
+        """Entraînement"""
+        try:
+            if class_weights and self.model_type == 'xgboost':
+                # XGBoost gère les poids différemment
+                sample_weights = np.array([class_weights.get(y, 1.0) for y in y_train])
+                self.model.fit(X_train, y_train, sample_weight=sample_weights)
+            else:
+                self.model.fit(X_train, y_train)
+
+            self.is_trained = True
+            logger.info(f"✓ {self.name} entraîné")
+            return self
+
+        except Exception as e:
+            logger.error(f"Erreur entraînement {self.name}: {e}")
+            raise
+
+    def predict(self, X):
+        return self.model.predict(X)
+
+    def predict_proba(self, X):
+        return self.model.predict_proba(X)
+
+    def save(self, path):
+        import joblib
+        joblib.dump(self.model, path)
+
+    def load(self, path):
+        import joblib
+        self.model = joblib.load(path)
+        self.is_trained = True
+        return self
+
+
+class CNNModel(BaseModel):
+    """Modèle CNN pour ECG"""
+
+    def __init__(self, config: ECGConfig, input_shape: Tuple, n_classes: int):
+        super().__init__("CNN", config)
+        self.input_shape = input_shape
+        self.n_classes = n_classes
+        self._build_model()
+
+    def _build_model(self):
+        """Architecture CNN optimisée"""
+        if not TF_AVAILABLE:
+            raise RuntimeError("TensorFlow non disponible")
+
+        inputs = layers.Input(shape=self.input_shape)
+
+        # Bloc 1
+        x = layers.Conv1D(64, 7, padding='same', activation='relu')(inputs)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling1D(2)(x)
+        x = layers.Dropout(0.3)(x)
+
+        # Bloc 2
+        x = layers.Conv1D(128, 5, padding='same', activation='relu')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling1D(2)(x)
+        x = layers.Dropout(0.3)(x)
+
+        # Bloc 3
+        x = layers.Conv1D(256, 3, padding='same', activation='relu')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.MaxPooling1D(2)(x)
+        x = layers.Dropout(0.4)(x)
+
+        # Classifier
+        x = layers.GlobalAveragePooling1D()(x)
+        x = layers.Dense(256, activation='relu', kernel_regularizer=regularizers.l2(0.001))(x)
+        x = layers.Dropout(0.5)(x)
+        outputs = layers.Dense(self.n_classes, activation='softmax')(x)
+
+        self.model = models.Model(inputs, outputs)
+        self.model.compile(
+            optimizer=optimizers.Adam(learning_rate=0.001),
+            loss='sparse_categorical_crossentropy',
+            metrics=['accuracy']
+        )
+
+    def train(self, X_train, y_train, class_weights=None, X_val=None, y_val=None):
+        """Entraînement avec callbacks"""
+
+        # Callbacks
+        cb = [
+            callbacks.EarlyStopping(
+                patience=self.config.early_stopping_patience,
+                restore_best_weights=True,
+                monitor='val_loss'
+            ),
+            callbacks.ReduceLROnPlateau(
+                factor=0.5,
+                patience=self.config.reduce_lr_patience,
+                min_lr=self.config.min_lr,
+                monitor='val_loss'
+            )
+        ]
+
+        # Validation split
+        validation_data = None
+        if X_val is not None and y_val is not None:
+            validation_data = (X_val, y_val)
+
+        # Entraînement
+        history = self.model.fit(
+            X_train, y_train,
+            batch_size=self.config.batch_size,
+            epochs=self.config.max_epochs,
+            validation_data=validation_data,
+            class_weight=class_weights,
+            callbacks=cb,
+            verbose=1
+        )
+
+        self.training_history = history.history
+        self.is_trained = True
+        logger.info(f"✓ CNN entraîné - {len(history.history['loss'])} epochs")
+        return self
+
+    def predict(self, X):
+        return np.argmax(self.model.predict(X, verbose=0), axis=1)
+
+    def predict_proba(self, X):
+        return self.model.predict(X, verbose=0)
+
+    def save(self, path):
+        self.model.save(path)
+
+    def load(self, path):
+        self.model = models.load_model(path)
+        self.is_trained = True
+        return self
+
+
+# ============================================================
+# PIPELINE PRINCIPAL
+# ============================================================
+class ECGPipeline:
+    """Pipeline complet d'analyse ECG"""
+
+    def __init__(self, config: Optional[ECGConfig] = None):
+        self.config = config or ECGConfig()
+        self.cache = CacheManager(self.config.cache_dir) if self.config.cache_enabled else None
+        self.loader = ECGDataLoader(self.config, self.cache)
+        self.extractor = FeatureExtractor(self.config)
+
+        self.segments: Optional[np.ndarray] = None
+        self.labels: Optional[np.ndarray] = None
+        self.features_df: Optional[pd.DataFrame] = None
+        self.label_encoder = LabelEncoder()
+
+        self.models: Dict[str, BaseModel] = {}
+        self.results: Dict[str, Dict] = {}
+
+    def load_data(self, records: List[str], download: bool = True) -> 'ECGPipeline':
+        """Charge les données"""
+        if download:
+            self.loader.download_records(records)
+
+        all_segments = []
+        all_labels = []
+
+        for record_name in records:
+            record = self.loader.load_record(record_name)
+            if record is None:
+                continue
+
+            segs, labs, _ = self.extractor.extract_segments(record)
+            if len(segs) > 0:
+                all_segments.append(segs)
+                all_labels.append(labs)
+
+        if not all_segments:
+            raise ValueError("Aucun segment extrait!")
+
+        self.segments = np.concatenate(all_segments)
+        self.labels = np.concatenate(all_labels)
+
+        # Filtrer les labels valides
+        mask = np.isin(self.labels, self.config.valid_labels)
+        self.segments = self.segments[mask]
+        self.labels = self.labels[mask]
+
+        logger.info(f"Données chargées: {len(self.segments)} segments, "
+                    f"{len(np.unique(self.labels))} classes")
+        return self
+
+    def extract_features(self) -> 'ECGPipeline':
+        """Extrait les caractéristiques"""
+        if self.segments is None:
+            raise RuntimeError("Pas de données chargées")
+
+        # Features morphologiques
+        morph_df = self.extractor.extract_morphological_features(self.segments)
+        morph_df['Label'] = self.labels
+
+        self.features_df = morph_df
+        logger.info(f"Features extraites: {self.features_df.shape[1] - 1} dimensions")
+        return self
+
+    def prepare_ml_data(self) -> Tuple:
+        """Prépare les données pour ML classique"""
+        if self.features_df is None:
+            raise RuntimeError("Pas de features extraites")
+
+        # Nettoyage
+        df = self.features_df.dropna()
+        if len(df) == 0:
+            raise ValueError("DataFrame vide après nettoyage")
+
+        # Features et labels
+        X = df.drop('Label', axis=1).values
+        y = self.label_encoder.fit_transform(df['Label'])
+
+        # Split train/val/test
+        X_temp, X_test, y_temp, y_test = train_test_split(
+            X, y, test_size=self.config.test_size,
+            stratify=y, random_state=self.config.random_state
+        )
+
+        val_size = self.config.val_size / (1 - self.config.test_size)
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_temp, y_temp, test_size=val_size,
+            stratify=y_temp, random_state=self.config.random_state
+        )
+
+        # Standardisation
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_val = scaler.transform(X_val)
+        X_test = scaler.transform(X_test)
+
+        # Poids de classe
+        class_weights = compute_class_weight(
+            'balanced', classes=np.unique(y_train), y=y_train
+        )
+        class_weight_dict = dict(enumerate(class_weights))
+
+        return (X_train, X_val, X_test, y_train, y_val, y_test,
+                class_weight_dict, scaler)
+
+    def prepare_dl_data(self) -> Tuple:
+        """Prépare les données pour Deep Learning"""
+        if self.segments is None:
+            raise RuntimeError("Pas de données chargées")
+
+        # Reshape pour CNN (samples, length, channels)
+        X = self.segments.reshape(self.segments.shape[0],
+                                  self.segments.shape[1], 1)
+        y = self.label_encoder.fit_transform(self.labels)
+
+        # Split
+        X_temp, X_test, y_temp, y_test = train_test_split(
+            X, y, test_size=self.config.test_size,
+            stratify=y, random_state=self.config.random_state
+        )
+
+        val_size = self.config.val_size / (1 - self.config.test_size)
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_temp, y_temp, test_size=val_size,
+            stratify=y_temp, random_state=self.config.random_state
+        )
+
+        # Poids de classe
+        class_weights = compute_class_weight(
+            'balanced', classes=np.unique(y_train), y=y_train
+        )
+
+        return (X_train, X_val, X_test, y_train, y_val, y_test,
+                dict(enumerate(class_weights)))
+
+    def train_classical_models(self, X_train, X_val, X_test, y_train, y_val, y_test,
+                               class_weights, scaler) -> 'ECGPipeline':
+        """Entraîne les modèles classiques"""
+        models_to_train = ['rf', 'logistic']
+        if XGB_AVAILABLE:
+            models_to_train.append('xgboost')
+
+        for model_type in models_to_train:
+            try:
+                model = SklearnModel(model_type, self.config)
+                model.train(X_train, y_train, class_weights)
+
+                # Évaluation
+                results = model.evaluate(X_test, y_test, self.label_encoder)
+                self.models[model_type] = model
+                self.results[model_type] = results
+
+                logger.info(f"{model_type}: F1={results['f1_score']:.3f}, "
+                            f"Acc={results['accuracy']:.3f}")
+
+            except Exception as e:
+                logger.error(f"Erreur entraînement {model_type}: {e}")
+
+        return self
+
+    def train_cnn(self, X_train, X_val, X_test, y_train, y_val, y_test,
+                  class_weights) -> 'ECGPipeline':
+        """Entraîne le CNN"""
+        if not TF_AVAILABLE:
+            logger.warning("TensorFlow non disponible - CNN ignoré")
+            return self
+
+        try:
+            model = CNNModel(self.config, X_train.shape[1:],
+                             len(np.unique(y_train)))
+            model.train(X_train, y_train, class_weights, X_val, y_val)
+
+            results = model.evaluate(X_test, y_test, self.label_encoder)
+            self.models['cnn'] = model
+            self.results['cnn'] = results
+
+            logger.info(f"CNN: F1={results['f1_score']:.3f}, "
+                        f"Acc={results['accuracy']:.3f}")
+
+        except Exception as e:
+            logger.error(f"Erreur entraînement CNN: {e}")
+
+        return self
+
+    def generate_report(self, output_dir: str = "report"):
+        """Génère un rapport complet"""
+        Path(output_dir).mkdir(exist_ok=True)
+
+        # Résumé des performances
+        summary = []
+        for name, results in self.results.items():
+            summary.append({
+                'Model': name,
+                'F1-Score': f"{results['f1_score']:.3f}",
+                'Accuracy': f"{results['accuracy']:.3f}"
+            })
+
+        summary_df = pd.DataFrame(summary)
+        summary_df.to_csv(f"{output_dir}/performance_summary.csv", index=False)
+
+        # Visualisations
+        self._plot_confusion_matrices(output_dir)
+        self._plot_roc_curves(output_dir)
+        self._plot_model_comparison(output_dir)
+
+        logger.info(f"Rapport sauvegardé dans {output_dir}/")
+
+    def _plot_confusion_matrices(self, output_dir: str):
+        """Trace les matrices de confusion"""
+        for name, results in self.results.items():
+            plt.figure(figsize=(8, 6))
+            sns.heatmap(results['confusion_matrix'], annot=True, fmt='d',
+                        cmap='Blues', cbar=False)
+            plt.title(f"Matrice de Confusion - {name}")
+            plt.xlabel("Prédit")
+            plt.ylabel("Réel")
+            plt.tight_layout()
+            plt.savefig(f"{output_dir}/cm_{name}.png", dpi=300)
+            plt.close()
+
+    def _plot_roc_curves(self, output_dir: str):
+        """Trace les courbes ROC"""
+        plt.figure(figsize=(10, 8))
+
+        for name, results in self.results.items():
+            y_test_bin = label_binarize(
+                results['predictions'],
+                classes=range(len(self.label_encoder.classes_))
+            )
+
+            # Micro-average ROC
+            fpr, tpr, _ = roc_curve(y_test_bin.ravel(),
+                                    results['probabilities'].ravel())
+            roc_auc = auc(fpr, tpr)
+
+            plt.plot(fpr, tpr, label=f"{name} (AUC = {roc_auc:.2f})")
+
+        plt.plot([0, 1], [0, 1], 'k--')
+        plt.xlabel('Taux de Faux Positifs')
+        plt.ylabel('Taux de Vrais Positifs')
+        plt.title('Courbes ROC')
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/roc_curves.png", dpi=300)
+        plt.close()
+
+    def _plot_model_comparison(self, output_dir: str):
+        """Compare les modèles"""
+        names = list(self.results.keys())
+        f1_scores = [self.results[n]['f1_score'] for n in names]
+
+        plt.figure(figsize=(10, 6))
+        bars = plt.bar(names, f1_scores, color='skyblue', edgecolor='navy')
+        plt.ylim([0, 1])
+        plt.ylabel('F1-Score')
+        plt.title('Comparaison des Modèles')
+
+        for bar, score in zip(bars, f1_scores):
+            plt.text(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.01,
+                     f'{score:.3f}', ha='center', va='bottom')
+
+        plt.tight_layout()
+        plt.savefig(f"{output_dir}/model_comparison.png", dpi=300)
+        plt.close()
+
+
+# ============================================================
+# POINT D'ENTRÉE
+# ============================================================
+def main():
+    """Fonction principale"""
+    # Configuration
+    config = ECGConfig(
+        n_workers=4,
+        max_epochs=50,
+        cache_enabled=True
+    )
+
+    # Records MIT-BIH (48 standard)
+    records = [f"{i:03d}" for i in range(100, 235)
+               if i not in [104, 110, 120, 204, 206, 211, 216, 218, 224, 225, 226, 227, 229]]
+
+    # Pipeline
+    pipeline = ECGPipeline(config)
+
+    try:
+        # Exécution
+        (pipeline
+         .load_data(records[:10])  # Limiter pour test
+         .extract_features())
+
+        # ML Classique
+        ml_data = pipeline.prepare_ml_data()
+        pipeline.train_classical_models(*ml_data)
+
+        # Deep Learning
+        dl_data = pipeline.prepare_dl_data()
+        pipeline.train_cnn(*dl_data)
+
+        # Rapport
+        pipeline.generate_report()
+
+        logger.info("✓ Analyse terminée avec succès!")
+
+    except Exception as e:
+        logger.error(f"✗ Erreur fatale: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
