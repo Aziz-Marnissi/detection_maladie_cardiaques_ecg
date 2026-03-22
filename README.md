@@ -72,7 +72,7 @@ ECGPipeline       →  orchestrateur principal
 
 ```bash
 # Cloner le dépôt
-git clone https://github.com/votre-utilisateur/ecg-classification.git
+git clone https://github.com/Aziz-Marnissi/ecg-classification.git
 cd ecg-classification
 
 # Environnement virtuel
